@@ -45,7 +45,16 @@ SECRET_KEY = 'django-insecure-#$p713r0*!e_p+gs9yx))la8of$q-t25l*vgb7pd&ph!2#otw@
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+_env_allowed_hosts = os.getenv('ALLOWED_HOSTS', '').strip()
+if _env_allowed_hosts:
+    ALLOWED_HOSTS = [h.strip() for h in _env_allowed_hosts.split(',') if h.strip()]
+else:
+    ALLOWED_HOSTS = [
+        '127.0.0.1',
+        'localhost',
+        '.ngrok-free.app',
+    ]
+
 
 
 # Application definition
@@ -75,6 +84,20 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+_env_csrf_trusted_origins = os.getenv('CSRF_TRUSTED_ORIGINS', '').strip()
+if _env_csrf_trusted_origins:
+    CSRF_TRUSTED_ORIGINS = [
+        o.strip() for o in _env_csrf_trusted_origins.split(',') if o.strip()
+    ]
+else:
+    CSRF_TRUSTED_ORIGINS = [
+        'https://*.ngrok-free.app',
+    ]
+
+# ngrok forwards the original scheme/host using proxy headers.
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 ROOT_URLCONF = 'SmartReminder.urls'
 
