@@ -6,9 +6,21 @@ class GmailConnectRequestSerializer(serializers.Serializer):
     redirect_uri = serializers.URLField()
 
 
+class GoogleCalendarConnectRequestSerializer(serializers.Serializer):
+    authorization_code = serializers.CharField()
+    redirect_uri = serializers.URLField()
+
+
 class GmailConnectResponseSerializer(serializers.Serializer):
     connected = serializers.BooleanField()
     gmail_email = serializers.EmailField()
+    token_expiry = serializers.DateTimeField(allow_null=True)
+    scope = serializers.CharField()
+
+
+class GoogleCalendarConnectResponseSerializer(serializers.Serializer):
+    connected = serializers.BooleanField()
+    google_email = serializers.EmailField()
     token_expiry = serializers.DateTimeField(allow_null=True)
     scope = serializers.CharField()
 
@@ -47,6 +59,7 @@ class GoogleCalendarSyncRequestSerializer(serializers.Serializer):
         required=False,
         allow_empty=False,
     )
+    calendar_id = serializers.CharField(required=False, allow_blank=False, default='primary')
 
 
 class GoogleCalendarSyncResponseSerializer(serializers.Serializer):
@@ -54,3 +67,12 @@ class GoogleCalendarSyncResponseSerializer(serializers.Serializer):
     synced = serializers.IntegerField()
     failed = serializers.IntegerField()
     results = serializers.ListField(child=serializers.DictField(), required=False)
+
+
+class GoogleCalendarTaskSyncResultSerializer(serializers.Serializer):
+    task_id = serializers.IntegerField()
+    title = serializers.CharField()
+    status = serializers.CharField()
+    calendar_id = serializers.CharField(required=False)
+    calendar_event_id = serializers.CharField(required=False)
+    error = serializers.CharField(required=False)

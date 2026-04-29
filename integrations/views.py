@@ -29,6 +29,7 @@ from tasks.models import Task
 from .models import (
     GmailIntegration,
     GmailSyncedMessage,
+    GoogleCalendarIntegration,
     GoogleCalendarTaskSync,
     WhatsAppIntegration,
     WhatsAppSyncedMessage,
@@ -37,6 +38,9 @@ from .serializers import (
     GmailConnectRequestSerializer,
     GmailConnectResponseSerializer,
     GmailFetchResponseSerializer,
+    GoogleCalendarConnectRequestSerializer,
+    GoogleCalendarConnectResponseSerializer,
+    GoogleCalendarTaskSyncResultSerializer,
     GoogleCalendarSyncRequestSerializer,
     GoogleCalendarSyncResponseSerializer,
     WhatsAppConnectRequestSerializer,
@@ -127,6 +131,17 @@ def _build_gmail_headers(access_token):
     return {'Authorization': f'Bearer {access_token}'}
 
 
+def _get_google_oauth_client_credentials():
+    client_id = os.getenv('GOOGLE_CLIENT_ID') or os.getenv('GMAIL_CLIENT_ID')
+    client_secret = os.getenv('GOOGLE_CLIENT_SECRET') or os.getenv('GMAIL_CLIENT_SECRET')
+    if not client_id or not client_secret:
+        raise ValueError(
+            'GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be configured. '
+            'Fallback to GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET is supported.'
+        )
+    return client_id, client_secret
+
+
 def _has_calendar_scope(scope_value):
     if not scope_value:
         return False
@@ -194,12 +209,22 @@ def _update_calendar_event(access_token, calendar_id, event_id, task):
     )
 
 
-def _exchange_oauth_code_for_tokens(authorization_code, redirect_uri):
-    client_id = os.getenv('GMAIL_CLIENT_ID')
-    client_secret = os.getenv('GMAIL_CLIENT_SECRET')
+def _delete_calendar_event(access_token, calendar_id, event_id):
+    safe_calendar_id = urllib.parse.quote(calendar_id, safe='')
+    safe_event_id = urllib.parse.quote(event_id, safe='')
+    url = (
+        f'https://www.googleapis.com/calendar/v3/calendars/{safe_calendar_id}/events/'
+        f'{safe_event_id}'
+    )
+    return _json_request(
+        url,
+        method='DELETE',
+        headers=_build_google_calendar_headers(access_token),
+    )
 
-    if not client_id or not client_secret:
-        raise ValueError('GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be configured.')
+
+def _exchange_oauth_code_for_tokens(authorization_code, redirect_uri):
+    client_id, client_secret = _get_google_oauth_client_credentials()
 
     token_payload = {
         'code': authorization_code,
@@ -219,11 +244,8 @@ def _exchange_oauth_code_for_tokens(authorization_code, redirect_uri):
     expires_in = token_data.get('expires_in')
     scope = token_data.get('scope', '')
 
-    if not access_token or not refresh_token:
-        raise ValueError(
-            'Google token response is missing access_token/refresh_token. '
-            'Ensure offline access and consent prompt are enabled in OAuth flow.'
-        )
+    if not access_token:
+        raise ValueError('Google token response is missing access_token.')
 
     token_expiry = None
     if expires_in:
@@ -238,10 +260,7 @@ def _exchange_oauth_code_for_tokens(authorization_code, redirect_uri):
 
 
 def _refresh_access_token(integration):
-    client_id = os.getenv('GMAIL_CLIENT_ID')
-    client_secret = os.getenv('GMAIL_CLIENT_SECRET')
-    if not client_id or not client_secret:
-        raise ValueError('GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be configured.')
+    client_id, client_secret = _get_google_oauth_client_credentials()
 
     token_payload = {
         'client_id': client_id,
@@ -283,6 +302,13 @@ def _get_gmail_profile(access_token):
     return _json_request(
         'https://gmail.googleapis.com/gmail/v1/users/me/profile',
         headers=_build_gmail_headers(access_token),
+    )
+
+
+def _get_google_user_profile(access_token):
+    return _json_request(
+        'https://www.googleapis.com/oauth2/v2/userinfo',
+        headers=_build_google_calendar_headers(access_token),
     )
 
 
@@ -563,6 +589,7 @@ def gmail_connect(request):
 
     authorization_code = serializer.validated_data['authorization_code']
     redirect_uri = serializer.validated_data['redirect_uri']
+    existing_integration = GmailIntegration.objects.filter(user=user).first()
 
     try:
         token_data = _exchange_oauth_code_for_tokens(authorization_code, redirect_uri)
@@ -577,12 +604,27 @@ def gmail_connect(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
+    refresh_token = token_data.get('refresh_token')
+    if not refresh_token and existing_integration:
+        refresh_token = existing_integration.refresh_token
+
+    if not refresh_token:
+        return Response(
+            {
+                'error': (
+                    'Google token response did not include refresh_token. '
+                    'Reconnect with offline access and consent prompt.'
+                )
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
     integration, _created = GmailIntegration.objects.update_or_create(
         user=user,
         defaults={
             'gmail_email': gmail_email,
             'access_token': token_data['access_token'],
-            'refresh_token': token_data['refresh_token'],
+            'refresh_token': refresh_token,
             'token_expiry': token_data['token_expiry'],
             'scope': token_data['scope'],
         },
@@ -737,6 +779,79 @@ def gmail_fetch(request):
         'tasks': created_tasks,
     }
     return Response(response_payload, status=status.HTTP_200_OK)
+
+
+@swagger_auto_schema(
+    method='post',
+    request_body=GoogleCalendarConnectRequestSerializer,
+    responses={
+        200: GoogleCalendarConnectResponseSerializer(),
+        400: 'Bad Request',
+        401: 'Unauthorized',
+        502: 'Google API Error',
+    },
+)
+@api_view(['POST'])
+def google_calendar_connect(request):
+    user = _get_user_from_auth_header(request)
+    if user is None:
+        return _unauthorized_response()
+
+    serializer = GoogleCalendarConnectRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    authorization_code = serializer.validated_data['authorization_code']
+    redirect_uri = serializer.validated_data['redirect_uri']
+    existing_integration = GoogleCalendarIntegration.objects.filter(user=user).first()
+
+    try:
+        token_data = _exchange_oauth_code_for_tokens(authorization_code, redirect_uri)
+        profile = _get_google_user_profile(token_data['access_token'])
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    google_email = profile.get('email')
+    if not google_email:
+        return Response(
+            {'error': 'Could not resolve Google account email from user profile.'},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    refresh_token = token_data.get('refresh_token')
+    if not refresh_token and existing_integration:
+        refresh_token = existing_integration.refresh_token
+
+    if not refresh_token:
+        return Response(
+            {
+                'error': (
+                    'Google token response did not include refresh_token. '
+                    'Reconnect with offline access and consent prompt.'
+                )
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    integration, _created = GoogleCalendarIntegration.objects.update_or_create(
+        user=user,
+        defaults={
+            'google_email': google_email,
+            'access_token': token_data['access_token'],
+            'refresh_token': refresh_token,
+            'token_expiry': token_data['token_expiry'],
+            'scope': token_data['scope'],
+        },
+    )
+
+    return Response(
+        {
+            'connected': True,
+            'google_email': integration.google_email,
+            'token_expiry': integration.token_expiry,
+            'scope': integration.scope,
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 @swagger_auto_schema(
@@ -1023,6 +1138,64 @@ def whatsapp_fetch(request):
     )
 
 
+def _get_google_calendar_integration_for_user(user):
+    try:
+        return GoogleCalendarIntegration.objects.get(user=user)
+    except GoogleCalendarIntegration.DoesNotExist:
+        return None
+
+
+def _mark_google_calendar_sync_failed(sync_record, error_text):
+    if sync_record:
+        sync_record.status = GoogleCalendarTaskSync.STATUS_FAILED
+        sync_record.error_message = error_text
+        sync_record.save(update_fields=['status', 'error_message', 'synced_at'])
+
+
+def _sync_task_to_google_calendar(user, integration, task, calendar_id='primary'):
+    sync_record = GoogleCalendarTaskSync.objects.filter(user=user, task=task).first()
+
+    if sync_record:
+        _update_calendar_event(
+            integration.access_token,
+            sync_record.calendar_id,
+            sync_record.calendar_event_id,
+            task,
+        )
+        sync_record.status = GoogleCalendarTaskSync.STATUS_SYNCED
+        sync_record.error_message = ''
+        sync_record.save(update_fields=['status', 'error_message', 'synced_at'])
+        return {
+            'task_id': task.id,
+            'title': task.title,
+            'status': 'synced',
+            'calendar_id': sync_record.calendar_id,
+            'calendar_event_id': sync_record.calendar_event_id,
+        }
+
+    calendar_data = _create_calendar_event(integration.access_token, task, calendar_id=calendar_id)
+    event_id = calendar_data.get('id')
+    event_calendar_id = calendar_data.get('organizer', {}).get('email') or calendar_id
+    if not event_id:
+        raise ValueError('Google Calendar response missing event id.')
+
+    sync_record = GoogleCalendarTaskSync.objects.create(
+        user=user,
+        integration=integration,
+        task=task,
+        calendar_id=event_calendar_id,
+        calendar_event_id=event_id,
+        status=GoogleCalendarTaskSync.STATUS_SYNCED,
+    )
+    return {
+        'task_id': task.id,
+        'title': task.title,
+        'status': 'synced',
+        'calendar_id': sync_record.calendar_id,
+        'calendar_event_id': sync_record.calendar_event_id,
+    }
+
+
 @swagger_auto_schema(
     method='post',
     request_body=GoogleCalendarSyncRequestSerializer,
@@ -1030,7 +1203,7 @@ def whatsapp_fetch(request):
         200: GoogleCalendarSyncResponseSerializer(),
         400: 'Bad Request',
         401: 'Unauthorized',
-        404: 'Gmail Not Connected',
+        404: 'Google Calendar Not Connected',
         502: 'Google API Error',
     },
 )
@@ -1040,11 +1213,15 @@ def google_calendar_sync_tasks(request):
     if user is None:
         return _unauthorized_response()
 
-    try:
-        integration = GmailIntegration.objects.get(user=user)
-    except GmailIntegration.DoesNotExist:
+    integration = _get_google_calendar_integration_for_user(user)
+    if integration is None:
         return Response(
-            {'error': 'Gmail is not connected. Connect Gmail before syncing calendar.'},
+            {
+                'error': (
+                    'Google Calendar is not connected. '
+                    'Call /api/integrations/google-calendar/connect first.'
+                )
+            },
             status=status.HTTP_404_NOT_FOUND,
         )
 
@@ -1052,7 +1229,7 @@ def google_calendar_sync_tasks(request):
         return Response(
             {
                 'error': (
-                    'Google Calendar scope is missing. Reconnect Gmail with '
+                    'Google Calendar scope is missing. Reconnect Google Calendar with '
                     '`https://www.googleapis.com/auth/calendar.events` scope.'
                 )
             },
@@ -1062,6 +1239,7 @@ def google_calendar_sync_tasks(request):
     serializer = GoogleCalendarSyncRequestSerializer(data=request.data or {})
     serializer.is_valid(raise_exception=True)
     task_ids = serializer.validated_data.get('task_ids', [])
+    calendar_id = serializer.validated_data.get('calendar_id', 'primary')
 
     tasks_qs = Task.objects.filter(user=user).order_by('datetime', 'id')
     if task_ids:
@@ -1075,7 +1253,7 @@ def google_calendar_sync_tasks(request):
         )
 
     try:
-        access_token = _ensure_valid_access_token(integration)
+        integration.access_token = _ensure_valid_access_token(integration)
     except ValueError as exc:
         return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
@@ -1086,55 +1264,13 @@ def google_calendar_sync_tasks(request):
     for task in tasks:
         sync_record = GoogleCalendarTaskSync.objects.filter(user=user, task=task).first()
         try:
-            if sync_record:
-                calendar_data = _update_calendar_event(
-                    access_token,
-                    sync_record.calendar_id,
-                    sync_record.calendar_event_id,
-                    task,
-                )
-                event_id = calendar_data.get('id', sync_record.calendar_event_id)
-                sync_record.calendar_event_id = event_id
-                sync_record.status = GoogleCalendarTaskSync.STATUS_SYNCED
-                sync_record.error_message = ''
-                sync_record.save(
-                    update_fields=[
-                        'calendar_event_id',
-                        'status',
-                        'error_message',
-                        'synced_at',
-                    ]
-                )
-            else:
-                calendar_data = _create_calendar_event(access_token, task)
-                event_id = calendar_data.get('id')
-                if not event_id:
-                    raise ValueError('Google Calendar response missing event id.')
-                GoogleCalendarTaskSync.objects.create(
-                    user=user,
-                    integration=integration,
-                    task=task,
-                    calendar_id='primary',
-                    calendar_event_id=event_id,
-                    status=GoogleCalendarTaskSync.STATUS_SYNCED,
-                )
-
+            result = _sync_task_to_google_calendar(user, integration, task, calendar_id=calendar_id)
             synced += 1
-            results.append(
-                {
-                    'task_id': task.id,
-                    'title': task.title,
-                    'status': 'synced',
-                }
-            )
+            results.append(result)
         except ValueError as exc:
             failed += 1
             error_text = str(exc)
-            if sync_record:
-                sync_record.status = GoogleCalendarTaskSync.STATUS_FAILED
-                sync_record.error_message = error_text
-                sync_record.save(update_fields=['status', 'error_message', 'synced_at'])
-
+            _mark_google_calendar_sync_failed(sync_record, error_text)
             results.append(
                 {
                     'task_id': task.id,
@@ -1153,3 +1289,94 @@ def google_calendar_sync_tasks(request):
         },
         status=status.HTTP_200_OK,
     )
+
+
+@swagger_auto_schema(
+    method='post',
+    responses={
+        200: GoogleCalendarTaskSyncResultSerializer(),
+        401: 'Unauthorized',
+        404: 'Task or Google Calendar Not Connected',
+        502: 'Google API Error',
+    },
+)
+@api_view(['POST'])
+def google_calendar_sync_task(request, task_id):
+    user = _get_user_from_auth_header(request)
+    if user is None:
+        return _unauthorized_response()
+
+    integration = _get_google_calendar_integration_for_user(user)
+    if integration is None:
+        return Response(
+            {
+                'error': (
+                    'Google Calendar is not connected. '
+                    'Call /api/integrations/google-calendar/connect first.'
+                )
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    task = Task.objects.filter(user=user, id=task_id).first()
+    if task is None:
+        return Response({'error': 'Task not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    try:
+        integration.access_token = _ensure_valid_access_token(integration)
+        result = _sync_task_to_google_calendar(user, integration, task)
+    except ValueError as exc:
+        sync_record = GoogleCalendarTaskSync.objects.filter(user=user, task=task).first()
+        error_text = str(exc)
+        _mark_google_calendar_sync_failed(sync_record, error_text)
+        return Response({'error': error_text}, status=status.HTTP_502_BAD_GATEWAY)
+
+    return Response(result, status=status.HTTP_200_OK)
+
+
+@swagger_auto_schema(
+    method='delete',
+    responses={
+        204: 'Deleted',
+        401: 'Unauthorized',
+        404: 'Task or sync record not found',
+        502: 'Google API Error',
+    },
+)
+@api_view(['DELETE'])
+def google_calendar_unsync_task(request, task_id):
+    user = _get_user_from_auth_header(request)
+    if user is None:
+        return _unauthorized_response()
+
+    integration = _get_google_calendar_integration_for_user(user)
+    if integration is None:
+        return Response(
+            {
+                'error': (
+                    'Google Calendar is not connected. '
+                    'Call /api/integrations/google-calendar/connect first.'
+                )
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    sync_record = GoogleCalendarTaskSync.objects.filter(
+        user=user,
+        task__id=task_id,
+        task__user=user,
+    ).first()
+    if sync_record is None:
+        return Response(
+            {'error': 'Calendar sync record not found for task.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    try:
+        access_token = _ensure_valid_access_token(integration)
+        _delete_calendar_event(access_token, sync_record.calendar_id, sync_record.calendar_event_id)
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    sync_record.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)

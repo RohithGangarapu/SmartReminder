@@ -20,6 +20,24 @@ class GmailIntegration(models.Model):
         return f'{self.user_id}:{self.gmail_email}'
 
 
+class GoogleCalendarIntegration(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='google_calendar_integration',
+    )
+    google_email = models.EmailField()
+    access_token = models.TextField()
+    refresh_token = models.TextField()
+    token_expiry = models.DateTimeField(null=True, blank=True)
+    scope = models.TextField(blank=True, default='')
+    connected_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.user_id}:{self.google_email}'
+
+
 class GmailSyncedMessage(models.Model):
     STATUS_CREATED = 'created'
     STATUS_SKIPPED = 'skipped'
@@ -151,7 +169,7 @@ class GoogleCalendarTaskSync(models.Model):
         related_name='google_calendar_task_syncs',
     )
     integration = models.ForeignKey(
-        GmailIntegration,
+        GoogleCalendarIntegration,
         on_delete=models.CASCADE,
         related_name='google_calendar_task_syncs',
     )

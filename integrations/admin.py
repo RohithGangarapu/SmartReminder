@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     GmailIntegration,
     GmailSyncedMessage,
+    GoogleCalendarIntegration,
     GoogleCalendarTaskSync,
     WhatsAppIntegration,
     WhatsAppSyncedMessage,
@@ -35,6 +36,13 @@ class GmailSyncedMessageAdmin(admin.ModelAdmin):
         'user__email',
     )
     ordering = ('-fetched_at',)
+
+
+@admin.register(GoogleCalendarIntegration)
+class GoogleCalendarIntegrationAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'google_email', 'connected_at', 'updated_at')
+    search_fields = ('google_email', 'user__username', 'user__email')
+    ordering = ('-connected_at',)
 
 
 @admin.register(WhatsAppIntegration)
