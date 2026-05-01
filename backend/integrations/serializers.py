@@ -25,6 +25,12 @@ class GoogleCalendarConnectResponseSerializer(serializers.Serializer):
     scope = serializers.CharField()
 
 
+class GoogleCalendarAuthUrlResponseSerializer(serializers.Serializer):
+    auth_url = serializers.URLField()
+    redirect_uri = serializers.URLField()
+    scope = serializers.CharField()
+
+
 class GmailFetchResponseSerializer(serializers.Serializer):
     fetched = serializers.IntegerField()
     created = serializers.IntegerField()

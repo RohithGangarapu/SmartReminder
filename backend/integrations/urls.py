@@ -5,6 +5,7 @@ from . import views
 urlpatterns = [
     path('gmail/connect', views.gmail_connect, name='gmail-connect'),
     path('gmail/fetch', views.gmail_fetch, name='gmail-fetch'),
+    path('google-calendar/auth-url', views.google_calendar_auth_url, name='google-calendar-auth-url'),
     path('google-calendar/connect', views.google_calendar_connect, name='google-calendar-connect'),
     path('google-calendar/sync-tasks', views.google_calendar_sync_tasks, name='google-calendar-sync-tasks'),
     path('google-calendar/sync-task/<int:task_id>', views.google_calendar_sync_task, name='google-calendar-sync-task'),

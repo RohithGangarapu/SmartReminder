@@ -37,6 +37,7 @@ from .models import (
 from .serializers import (
     GmailConnectRequestSerializer,
     GmailConnectResponseSerializer,
+    GoogleCalendarAuthUrlResponseSerializer,
     GmailFetchResponseSerializer,
     GoogleCalendarConnectRequestSerializer,
     GoogleCalendarConnectResponseSerializer,
@@ -154,6 +155,30 @@ def _has_calendar_scope(scope_value):
 
 def _build_google_calendar_headers(access_token):
     return {'Authorization': f'Bearer {access_token}'}
+
+
+def _build_google_calendar_oauth_url(redirect_uri):
+    client_id, _client_secret = _get_google_oauth_client_credentials()
+    scope = os.getenv(
+        'GOOGLE_OAUTH_SCOPES',
+        (
+            'https://www.googleapis.com/auth/calendar.events '
+            'https://www.googleapis.com/auth/userinfo.email'
+        ),
+    )
+    params = {
+        'client_id': client_id,
+        'redirect_uri': redirect_uri,
+        'response_type': 'code',
+        'scope': scope,
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'include_granted_scopes': 'true',
+    }
+    return (
+        'https://accounts.google.com/o/oauth2/v2/auth?'
+        f'{urllib.parse.urlencode(params)}'
+    )
 
 
 def _build_google_calendar_event_payload(task):
@@ -779,6 +804,44 @@ def gmail_fetch(request):
         'tasks': created_tasks,
     }
     return Response(response_payload, status=status.HTTP_200_OK)
+
+
+@swagger_auto_schema(
+    method='get',
+    responses={200: GoogleCalendarAuthUrlResponseSerializer(), 401: 'Unauthorized', 400: 'Bad Request'},
+)
+@api_view(['GET'])
+def google_calendar_auth_url(request):
+    user = _get_user_from_auth_header(request)
+    if user is None:
+        return _unauthorized_response()
+
+    redirect_uri = request.query_params.get('redirect_uri') or os.getenv('GOOGLE_REDIRECT_URI')
+    if not redirect_uri:
+        return Response(
+            {'error': 'redirect_uri is required as query param or GOOGLE_REDIRECT_URI in env.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        auth_url = _build_google_calendar_oauth_url(redirect_uri)
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(
+        {
+            'auth_url': auth_url,
+            'redirect_uri': redirect_uri,
+            'scope': os.getenv(
+                'GOOGLE_OAUTH_SCOPES',
+                (
+                    'https://www.googleapis.com/auth/calendar.events '
+                    'https://www.googleapis.com/auth/userinfo.email'
+                ),
+            ),
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 @swagger_auto_schema(
