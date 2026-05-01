@@ -16,8 +16,10 @@ except ImportError as exc:
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core import signing
 from django.db import IntegrityError
 from django.http import HttpResponse
+from django.shortcuts import redirect
 from django.utils import timezone
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework import status
@@ -44,6 +46,9 @@ from .serializers import (
     GoogleCalendarTaskSyncResultSerializer,
     GoogleCalendarSyncRequestSerializer,
     GoogleCalendarSyncResponseSerializer,
+    IntegrationsStatusResponseSerializer,
+    SyncNowRequestSerializer,
+    SyncNowResponseSerializer,
     WhatsAppConnectRequestSerializer,
     WhatsAppConnectResponseSerializer,
     WhatsAppFetchResponseSerializer,
@@ -133,13 +138,10 @@ def _build_gmail_headers(access_token):
 
 
 def _get_google_oauth_client_credentials():
-    client_id = os.getenv('GOOGLE_CLIENT_ID') or os.getenv('GMAIL_CLIENT_ID')
-    client_secret = os.getenv('GOOGLE_CLIENT_SECRET') or os.getenv('GMAIL_CLIENT_SECRET')
+    client_id = os.getenv('GOOGLE_CLIENT_ID')
+    client_secret = os.getenv('GOOGLE_CLIENT_SECRET')
     if not client_id or not client_secret:
-        raise ValueError(
-            'GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be configured. '
-            'Fallback to GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET is supported.'
-        )
+        raise ValueError('GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be configured.')
     return client_id, client_secret
 
 
@@ -153,6 +155,17 @@ def _has_calendar_scope(scope_value):
     )
 
 
+def _has_gmail_scope(scope_value):
+    if not scope_value:
+        return False
+    scopes = set(scope_value.split())
+    return (
+        'https://www.googleapis.com/auth/gmail.readonly' in scopes
+        or 'https://www.googleapis.com/auth/gmail.modify' in scopes
+        or 'https://mail.google.com/' in scopes
+    )
+
+
 def _build_google_calendar_headers(access_token):
     return {'Authorization': f'Bearer {access_token}'}
 
@@ -163,6 +176,7 @@ def _build_google_calendar_oauth_url(redirect_uri):
         'GOOGLE_OAUTH_SCOPES',
         (
             'https://www.googleapis.com/auth/calendar.events '
+            'https://www.googleapis.com/auth/gmail.readonly '
             'https://www.googleapis.com/auth/userinfo.email'
         ),
     )
@@ -204,6 +218,15 @@ def _build_google_calendar_event_payload(task):
             }
         },
     }
+
+
+def _build_google_oauth_state(user_id):
+    payload = {'user_id': user_id}
+    return signing.dumps(payload, salt='google-oauth-state')
+
+
+def _parse_google_oauth_state(state):
+    return signing.loads(state, salt='google-oauth-state', max_age=600)
 
 
 def _create_calendar_event(access_token, task, calendar_id='primary'):
@@ -697,112 +720,9 @@ def gmail_fetch(request):
         )
 
     try:
-        access_token = _ensure_valid_access_token(integration)
-        messages = _list_gmail_messages(access_token, max_results=max_results)
+        response_payload = _run_gmail_fetch_for_user(user, max_results=max_results)
     except ValueError as exc:
         return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
-
-    fetched = len(messages)
-    created = 0
-    skipped = 0
-    failed = 0
-    created_tasks = []
-
-    for entry in messages:
-        message_id = entry.get('id')
-        subject = ''
-        snippet = ''
-        if not message_id:
-            skipped += 1
-            continue
-
-        if GmailSyncedMessage.objects.filter(user=user, gmail_message_id=message_id).exists():
-            skipped += 1
-            continue
-
-        try:
-            metadata = _get_message_metadata(access_token, message_id)
-            subject = _extract_header_value(metadata, 'Subject')
-            snippet = metadata.get('snippet', '')
-
-            if _looks_non_actionable_email(subject, snippet):
-                skipped += 1
-                GmailSyncedMessage.objects.create(
-                    user=user,
-                    integration=integration,
-                    gmail_message_id=message_id,
-                    subject=subject,
-                    snippet=snippet,
-                    extraction_status=GmailSyncedMessage.STATUS_SKIPPED,
-                    error_message='Skipped by strict keyword filter (non-actionable/promotional).',
-                )
-                continue
-
-            extracted = _extract_email_task_strict(subject, snippet)
-            if not extracted.get('should_create_task'):
-                skipped += 1
-                GmailSyncedMessage.objects.create(
-                    user=user,
-                    integration=integration,
-                    gmail_message_id=message_id,
-                    subject=subject,
-                    snippet=snippet,
-                    extraction_status=GmailSyncedMessage.STATUS_SKIPPED,
-                    error_message=extracted.get('reason', 'Skipped by strict AI relevance filter.'),
-                )
-                continue
-
-            task_datetime = _parse_task_datetime(extracted['datetime'])
-
-            task = Task.objects.create(
-                user=user,
-                title=extracted['title'],
-                description=f'From Gmail: {subject}'.strip(),
-                datetime=task_datetime,
-                source='gmail',
-                status='pending',
-            )
-
-            GmailSyncedMessage.objects.create(
-                user=user,
-                integration=integration,
-                gmail_message_id=message_id,
-                subject=subject,
-                snippet=snippet,
-                task=task,
-                extraction_status=GmailSyncedMessage.STATUS_CREATED,
-            )
-
-            created += 1
-            created_tasks.append(
-                {
-                    'id': task.id,
-                    'title': task.title,
-                    'datetime': task.datetime.isoformat(),
-                    'source': task.source,
-                }
-            )
-        except IntegrityError:
-            skipped += 1
-        except ValueError as exc:
-            failed += 1
-            GmailSyncedMessage.objects.create(
-                user=user,
-                integration=integration,
-                gmail_message_id=message_id,
-                subject=subject,
-                snippet=snippet,
-                extraction_status=GmailSyncedMessage.STATUS_FAILED,
-                error_message=str(exc),
-            )
-
-    response_payload = {
-        'fetched': fetched,
-        'created': created,
-        'skipped': skipped,
-        'failed': failed,
-        'tasks': created_tasks,
-    }
     return Response(response_payload, status=status.HTTP_200_OK)
 
 
@@ -842,6 +762,111 @@ def google_calendar_auth_url(request):
         },
         status=status.HTTP_200_OK,
     )
+
+
+@swagger_auto_schema(
+    method='get',
+    responses={200: GoogleCalendarAuthUrlResponseSerializer(), 401: 'Unauthorized', 400: 'Bad Request'},
+)
+@api_view(['GET'])
+def google_oauth_start(request):
+    user = _get_user_from_auth_header(request)
+    if user is None:
+        return _unauthorized_response()
+
+    redirect_uri = os.getenv('GOOGLE_REDIRECT_URI')
+    if not redirect_uri:
+        return Response({'error': 'GOOGLE_REDIRECT_URI must be configured.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        state = _build_google_oauth_state(user.id)
+        auth_url = _build_google_calendar_oauth_url(redirect_uri)
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    joiner = '&' if '?' in auth_url else '?'
+    auth_url_with_state = f'{auth_url}{joiner}state={urllib.parse.quote(state, safe="")}'
+    return Response(
+        {
+            'auth_url': auth_url_with_state,
+            'redirect_uri': redirect_uri,
+            'scope': os.getenv(
+                'GOOGLE_OAUTH_SCOPES',
+                (
+                    'https://www.googleapis.com/auth/calendar.events '
+                    'https://www.googleapis.com/auth/gmail.readonly '
+                    'https://www.googleapis.com/auth/userinfo.email'
+                ),
+            ),
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@swagger_auto_schema(method='get', responses={302: 'Redirect'})
+@api_view(['GET'])
+def google_oauth_callback(request):
+    code = request.query_params.get('code', '')
+    state = request.query_params.get('state', '')
+    error = request.query_params.get('error', '')
+
+    success_url = os.getenv('GOOGLE_OAUTH_SUCCESS_URL', os.getenv('FRONTEND_URL', 'http://localhost:5173'))
+    failure_url = os.getenv('GOOGLE_OAUTH_FAILURE_URL', success_url)
+
+    if error:
+        return redirect(f'{failure_url}?google_oauth=error&reason={urllib.parse.quote(error)}')
+
+    if not code or not state:
+        return redirect(f'{failure_url}?google_oauth=error&reason=missing_code_or_state')
+
+    try:
+        state_payload = _parse_google_oauth_state(state)
+        user = User.objects.get(id=state_payload.get('user_id'))
+    except (signing.BadSignature, signing.SignatureExpired, User.DoesNotExist):
+        return redirect(f'{failure_url}?google_oauth=error&reason=invalid_state')
+
+    existing_gmail = GmailIntegration.objects.filter(user=user).first()
+    existing_calendar = GoogleCalendarIntegration.objects.filter(user=user).first()
+    redirect_uri = os.getenv('GOOGLE_REDIRECT_URI')
+
+    try:
+        token_data = _exchange_oauth_code_for_tokens(code, redirect_uri)
+        profile = _get_google_user_profile(token_data['access_token'])
+    except ValueError as exc:
+        return redirect(f'{failure_url}?google_oauth=error&reason={urllib.parse.quote(str(exc))}')
+
+    google_email = profile.get('email', '')
+    if not google_email:
+        return redirect(f'{failure_url}?google_oauth=error&reason=missing_google_email')
+
+    refresh_token = token_data.get('refresh_token')
+    if not refresh_token:
+        refresh_token = (
+            (existing_gmail.refresh_token if existing_gmail else None)
+            or (existing_calendar.refresh_token if existing_calendar else None)
+        )
+    if not refresh_token:
+        return redirect(f'{failure_url}?google_oauth=error&reason=missing_refresh_token')
+
+    scope = token_data.get('scope', '')
+    defaults = {
+        'access_token': token_data['access_token'],
+        'refresh_token': refresh_token,
+        'token_expiry': token_data['token_expiry'],
+        'scope': scope,
+    }
+    if _has_gmail_scope(scope):
+        GmailIntegration.objects.update_or_create(
+            user=user,
+            defaults={'gmail_email': google_email, **defaults},
+        )
+    if _has_calendar_scope(scope):
+        GoogleCalendarIntegration.objects.update_or_create(
+            user=user,
+            defaults={'google_email': google_email, **defaults},
+        )
+
+    return redirect(f'{success_url}?google_oauth=success')
 
 
 @swagger_auto_schema(
@@ -1215,6 +1240,169 @@ def _mark_google_calendar_sync_failed(sync_record, error_text):
         sync_record.save(update_fields=['status', 'error_message', 'synced_at'])
 
 
+def _run_gmail_fetch_for_user(user, max_results):
+    integration = GmailIntegration.objects.filter(user=user).first()
+    if integration is None:
+        return None
+
+    access_token = _ensure_valid_access_token(integration)
+    messages = _list_gmail_messages(access_token, max_results=max_results)
+
+    fetched = len(messages)
+    created = 0
+    skipped = 0
+    failed = 0
+    created_tasks = []
+
+    for entry in messages:
+        message_id = entry.get('id')
+        subject = ''
+        snippet = ''
+        if not message_id:
+            skipped += 1
+            continue
+
+        if GmailSyncedMessage.objects.filter(user=user, gmail_message_id=message_id).exists():
+            skipped += 1
+            continue
+
+        try:
+            metadata = _get_message_metadata(access_token, message_id)
+            subject = _extract_header_value(metadata, 'Subject')
+            snippet = metadata.get('snippet', '')
+
+            if _looks_non_actionable_email(subject, snippet):
+                skipped += 1
+                GmailSyncedMessage.objects.create(
+                    user=user,
+                    integration=integration,
+                    gmail_message_id=message_id,
+                    subject=subject,
+                    snippet=snippet,
+                    extraction_status=GmailSyncedMessage.STATUS_SKIPPED,
+                    error_message='Skipped by strict keyword filter (non-actionable/promotional).',
+                )
+                continue
+
+            extracted = _extract_email_task_strict(subject, snippet)
+            if not extracted.get('should_create_task'):
+                skipped += 1
+                GmailSyncedMessage.objects.create(
+                    user=user,
+                    integration=integration,
+                    gmail_message_id=message_id,
+                    subject=subject,
+                    snippet=snippet,
+                    extraction_status=GmailSyncedMessage.STATUS_SKIPPED,
+                    error_message=extracted.get('reason', 'Skipped by strict AI relevance filter.'),
+                )
+                continue
+
+            task_datetime = _parse_task_datetime(extracted['datetime'])
+            task = Task.objects.create(
+                user=user,
+                title=extracted['title'],
+                description=f'From Gmail: {subject}'.strip(),
+                datetime=task_datetime,
+                source='gmail',
+                status='pending',
+            )
+            GmailSyncedMessage.objects.create(
+                user=user,
+                integration=integration,
+                gmail_message_id=message_id,
+                subject=subject,
+                snippet=snippet,
+                task=task,
+                extraction_status=GmailSyncedMessage.STATUS_CREATED,
+            )
+            created += 1
+            created_tasks.append(
+                {
+                    'id': task.id,
+                    'title': task.title,
+                    'datetime': task.datetime.isoformat(),
+                    'source': task.source,
+                }
+            )
+        except IntegrityError:
+            skipped += 1
+        except ValueError as exc:
+            failed += 1
+            GmailSyncedMessage.objects.create(
+                user=user,
+                integration=integration,
+                gmail_message_id=message_id,
+                subject=subject,
+                snippet=snippet,
+                extraction_status=GmailSyncedMessage.STATUS_FAILED,
+                error_message=str(exc),
+            )
+
+    return {
+        'fetched': fetched,
+        'created': created,
+        'skipped': skipped,
+        'failed': failed,
+        'tasks': created_tasks,
+    }
+
+
+def _run_google_calendar_sync_for_user(user, task_ids=None, calendar_id='primary'):
+    integration = _get_google_calendar_integration_for_user(user)
+    if integration is None:
+        return None
+
+    if not _has_calendar_scope(integration.scope):
+        raise ValueError(
+            'Google Calendar scope is missing. Reconnect with '
+            'https://www.googleapis.com/auth/calendar.events scope.'
+        )
+
+    tasks_qs = Task.objects.filter(user=user).order_by('datetime', 'id')
+    if task_ids:
+        tasks_qs = tasks_qs.filter(id__in=task_ids)
+    tasks = list(tasks_qs)
+    if not tasks:
+        return {'total': 0, 'synced': 0, 'failed': 0, 'results': []}
+
+    integration.access_token = _ensure_valid_access_token(integration)
+    synced = 0
+    failed = 0
+    results = []
+    for task in tasks:
+        sync_record = GoogleCalendarTaskSync.objects.filter(user=user, task=task).first()
+        try:
+            result = _sync_task_to_google_calendar(user, integration, task, calendar_id=calendar_id)
+            synced += 1
+            results.append(result)
+        except ValueError as exc:
+            failed += 1
+            error_text = str(exc)
+            _mark_google_calendar_sync_failed(sync_record, error_text)
+            results.append(
+                {
+                    'task_id': task.id,
+                    'title': task.title,
+                    'status': 'failed',
+                    'error': error_text,
+                }
+            )
+
+    return {'total': len(tasks), 'synced': synced, 'failed': failed, 'results': results}
+
+
+def try_auto_sync_task_to_google_calendar(user, task):
+    integration = _get_google_calendar_integration_for_user(user)
+    if integration is None or not _has_calendar_scope(integration.scope):
+        return
+    try:
+        integration.access_token = _ensure_valid_access_token(integration)
+        _sync_task_to_google_calendar(user, integration, task)
+    except ValueError:
+        pass
+
+
 def _sync_task_to_google_calendar(user, integration, task, calendar_id='primary'):
     sync_record = GoogleCalendarTaskSync.objects.filter(user=user, task=task).first()
 
@@ -1304,54 +1492,81 @@ def google_calendar_sync_tasks(request):
     task_ids = serializer.validated_data.get('task_ids', [])
     calendar_id = serializer.validated_data.get('calendar_id', 'primary')
 
-    tasks_qs = Task.objects.filter(user=user).order_by('datetime', 'id')
-    if task_ids:
-        tasks_qs = tasks_qs.filter(id__in=task_ids)
-
-    tasks = list(tasks_qs)
-    if not tasks:
-        return Response(
-            {'total': 0, 'synced': 0, 'failed': 0, 'results': []},
-            status=status.HTTP_200_OK,
-        )
-
     try:
-        integration.access_token = _ensure_valid_access_token(integration)
+        payload = _run_google_calendar_sync_for_user(
+            user,
+            task_ids=task_ids,
+            calendar_id=calendar_id,
+        )
     except ValueError as exc:
         return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
-    synced = 0
-    failed = 0
-    results = []
+    return Response(payload, status=status.HTTP_200_OK)
 
-    for task in tasks:
-        sync_record = GoogleCalendarTaskSync.objects.filter(user=user, task=task).first()
-        try:
-            result = _sync_task_to_google_calendar(user, integration, task, calendar_id=calendar_id)
-            synced += 1
-            results.append(result)
-        except ValueError as exc:
-            failed += 1
-            error_text = str(exc)
-            _mark_google_calendar_sync_failed(sync_record, error_text)
-            results.append(
-                {
-                    'task_id': task.id,
-                    'title': task.title,
-                    'status': 'failed',
-                    'error': error_text,
-                }
-            )
 
-    return Response(
-        {
-            'total': len(tasks),
-            'synced': synced,
-            'failed': failed,
-            'results': results,
-        },
-        status=status.HTTP_200_OK,
-    )
+@swagger_auto_schema(
+    method='get',
+    responses={200: IntegrationsStatusResponseSerializer(), 401: 'Unauthorized'},
+)
+@api_view(['GET'])
+def integrations_status(request):
+    user = _get_user_from_auth_header(request)
+    if user is None:
+        return _unauthorized_response()
+
+    gmail = GmailIntegration.objects.filter(user=user).first()
+    whatsapp = WhatsAppIntegration.objects.filter(user=user).first()
+    gcal = GoogleCalendarIntegration.objects.filter(user=user).first()
+    user_tasks = Task.objects.filter(user=user)
+
+    payload = {
+        'gmail_connected': bool(gmail),
+        'gmail_email': gmail.gmail_email if gmail else '',
+        'whatsapp_connected': bool(whatsapp),
+        'whatsapp_phone_number_id': whatsapp.phone_number_id if whatsapp else '',
+        'google_calendar_connected': bool(gcal),
+        'google_calendar_email': gcal.google_email if gcal else '',
+        'total_tasks': user_tasks.count(),
+        'pending_tasks': user_tasks.exclude(status='done').count(),
+        'synced_tasks': GoogleCalendarTaskSync.objects.filter(user=user, status='synced').count(),
+    }
+    return Response(payload, status=status.HTTP_200_OK)
+
+
+@swagger_auto_schema(
+    method='post',
+    request_body=SyncNowRequestSerializer,
+    responses={
+        200: SyncNowResponseSerializer(),
+        401: 'Unauthorized',
+        502: 'Integration Sync Error',
+    },
+)
+@api_view(['POST'])
+def integrations_sync_now(request):
+    user = _get_user_from_auth_header(request)
+    if user is None:
+        return _unauthorized_response()
+
+    serializer = SyncNowRequestSerializer(data=request.data or {})
+    serializer.is_valid(raise_exception=True)
+
+    gmail_max_results = serializer.validated_data.get('gmail_max_results', 10)
+    calendar_id = serializer.validated_data.get('calendar_id', 'primary')
+    payload = {}
+
+    try:
+        gmail_result = _run_gmail_fetch_for_user(user, max_results=gmail_max_results)
+        if gmail_result is not None:
+            payload['gmail'] = gmail_result
+
+        calendar_result = _run_google_calendar_sync_for_user(user, calendar_id=calendar_id)
+        if calendar_result is not None:
+            payload['google_calendar'] = calendar_result
+    except ValueError as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    return Response(payload, status=status.HTTP_200_OK)
 
 
 @swagger_auto_schema(

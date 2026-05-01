@@ -15,6 +15,7 @@ from rest_framework.response import Response
 
 from .models import Task
 from .serializers import TaskSerializer
+from integrations.views import try_auto_sync_task_to_google_calendar
 
 User = get_user_model()
 
@@ -68,7 +69,8 @@ def tasks_collection(request):
 
     serializer = TaskSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-    serializer.save(user=user)
+    task = serializer.save(user=user)
+    try_auto_sync_task_to_google_calendar(user, task)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -85,7 +87,8 @@ def task_detail(request, id):
     if request.method == 'PUT':
         serializer = TaskSerializer(task, data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save(user=user)
+        task = serializer.save(user=user)
+        try_auto_sync_task_to_google_calendar(user, task)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     task.delete()
